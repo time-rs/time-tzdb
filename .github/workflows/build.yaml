@@ -1,0 +1,127 @@
+name: Build
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+
+defaults:
+  run:
+    shell: bash
+
+on:
+  push:
+    branches: ["**"]
+    tags-ignore: ["**"]
+    paths-ignore:
+      - "**.md"
+      - LICENSE-Apache
+      - LICENSE-MIT
+  pull_request:
+    paths-ignore:
+      - "**.md"
+      - "**/LICENSE-Apache"
+      - "**/LICENSE-MIT"
+      - .github/FUNDING.yml
+      - .editorconfig
+      - .gitignore
+
+jobs:
+  test:
+    name: Test (${{ matrix.rust.name }})
+    runs-on: ubuntu-latest
+    if: (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) || github.event_name == 'push'
+    strategy:
+      matrix:
+        rust:
+          - { version: "1.63.0", name: MSRV }
+          - { version: stable, name: stable }
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v3
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust.version }}
+
+      - name: Install cargo-hack
+        run: |
+          host=$(rustc -Vv | grep host | sed 's/host: //')
+          if [[ $host =~ windows ]]; then
+              curl -LsSf https://github.com/taiki-e/cargo-hack/releases/latest/download/cargo-hack-${host}.zip -o cargo-hack.zip
+              7z x cargo-hack.zip -o$HOME/.cargo/bin
+          elif [[ $host =~ darwin|linux ]]; then
+              curl -LsSf https://github.com/taiki-e/cargo-hack/releases/latest/download/cargo-hack-${host}.tar.gz | tar xzf - -C ~/.cargo/bin
+          else
+              echo "unsupported operating system"
+              exit 1
+          fi
+
+      - name: Cache cargo output
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --all-features
+
+  fmt:
+    name: Formatting
+    runs-on: ubuntu-latest
+    if: (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) || github.event_name == 'push'
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v3
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    if: (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) || github.event_name == 'push'
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v3
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo output
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run clippy
+        run: |
+          cargo clippy \
+          --all-features \
+          --benches \
+          --tests
+
+  documentation:
+    name: Documentation
+    runs-on: ubuntu-latest
+    if: (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) || github.event_name == 'push'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          persist-credentials: false
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo output
+        uses: Swatinem/rust-cache@v2
+
+      - name: Document public API
+        run: cargo doc --all-features --no-deps
