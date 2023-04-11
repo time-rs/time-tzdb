@@ -15,3 +15,4 @@ imports_granularity = "Module"
 group_imports = "StdExternalCrate"
 normalize_doc_attributes = true
 wrap_comments = true
+ignore = ["time-tzdb/src/raw_info.rs"]
