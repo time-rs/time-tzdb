@@ -40,7 +40,7 @@
 mod modules;
 mod to_code;
 
-use std::collections::{btree_map, BTreeMap};
+use std::collections::{btree_map, BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::fs::File;
 use std::io::Write;
@@ -61,8 +61,47 @@ use walkdir::WalkDir;
 use self::modules::Item;
 use self::to_code::ToCode;
 
-type TimeZones = Vec<(String, TzifData)>;
-type TimeZoneLinks = BTreeMap<String, Vec<String>>;
+#[derive(Debug)]
+struct TimeZone {
+    name: String,
+    data: TimeZoneData,
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+enum TimeZoneData {
+    Canonical(TzifData),
+    Link(String),
+}
+
+impl PartialEq for TimeZone {
+    fn eq(&self, other: &Self) -> bool {
+        self.name.eq(&other.name)
+    }
+}
+
+impl Eq for TimeZone {}
+
+impl PartialOrd for TimeZone {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TimeZone {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.name.cmp(&other.name)
+    }
+}
+
+impl TimeZone {
+    fn data_name(&self) -> &str {
+        match &self.data {
+            TimeZoneData::Canonical(_) => &self.name,
+            TimeZoneData::Link(canonical_name) => canonical_name,
+        }
+    }
+}
 
 /// Convert a time zone name to a valid Rust identifier.
 fn name_to_ident(name: &str, case: Case) -> String {
@@ -126,16 +165,15 @@ fn generate_tzif() -> Result<TempDir> {
 
 /// Gather the time zones from the tzif files. Requires the tzif files to be present in the provided
 /// directory.
-fn gather_time_zones(tzif_dir: TempDir) -> Result<(TimeZones, TimeZoneLinks)> {
+fn gather_time_zones(tzif_dir: TempDir) -> Result<BTreeSet<TimeZone>> {
     // It's not necessary to determine the canonical name for each hard link, as the final output
     // will have identical semantics. For this reason we can assume that the first time an inode is
     // seen, it is the canonical name.
     //
     // This isn't strictly necessary, but reduces the size of the generated code.
     let mut inode_to_tz_name = BTreeMap::new();
-    let mut tz_links = BTreeMap::new();
 
-    let mut time_zones = Vec::new();
+    let mut time_zones = BTreeSet::new();
 
     for entry in WalkDir::new(&tzif_dir) {
         let entry = entry?;
@@ -153,69 +191,49 @@ fn gather_time_zones(tzif_dir: TempDir) -> Result<(TimeZones, TimeZoneLinks)> {
 
         // Detect hard links, indicating a time zone is a link.
         match inode_to_tz_name.entry(path.metadata()?.ino()) {
-            // inode not seen before, so this is the canonical name. Take note of this and carry on.
+            // inode not seen before, so this is the canonical name.
             btree_map::Entry::Vacant(vacant_entry) => {
                 vacant_entry.insert(tz_name.clone());
+
+                // Get the data from the file.
+                let data = parse_tzif_file(path)?;
+                assert!(data.version_number() >= 2);
+                time_zones.insert(TimeZone {
+                    name: tz_name,
+                    data: TimeZoneData::Canonical(data),
+                });
             }
-            // inode has been seen before. Add it to the list of hard links and move to the next
-            // file.
+            // inode has been seen before, so this is a link.
             btree_map::Entry::Occupied(occupied_entry) => {
                 let canonical_name = occupied_entry.get().clone();
-                tz_links
-                    .entry(canonical_name)
-                    .or_insert_with(Vec::new)
-                    .push(tz_name.clone());
-                continue;
+                time_zones.insert(TimeZone {
+                    name: tz_name,
+                    data: TimeZoneData::Link(canonical_name),
+                });
             }
         }
-
-        // Get the data from the file.
-        let data = parse_tzif_file(path)?;
-        assert!(data.version_number() >= 2);
-        time_zones.push((tz_name, data));
     }
 
     tzif_dir.close()?;
 
-    Ok((time_zones, tz_links))
+    Ok(time_zones)
 }
 
 /// Write the time zones.
-fn write_zones(output: &mut impl Write, time_zones: &TimeZones) -> Result<()> {
-    for (tz_name, data) in time_zones {
-        let tz_ident = name_to_ident(tz_name, Case::UpperSnake);
-        let expr = data.to_code()?;
-        writeln!(
-            output,
-            "/// The `{tz_name}` time zone.\nconst {tz_ident}: TzifData = {expr};"
-        )?;
+fn write_zones<'a>(
+    output: &mut impl Write,
+    time_zones: impl Iterator<Item = &'a TimeZone>,
+) -> Result<()> {
+    for tz in time_zones {
+        write!(output, "{}", tz.to_code()?)?;
     }
-
-    Ok(())
-}
-
-/// Write the time zone links.
-fn write_links(output: &mut impl Write, tz_links: &TimeZoneLinks) -> Result<()> {
-    for (canonical_name, links) in tz_links {
-        let canonical_ident = name_to_ident(canonical_name, Case::UpperSnake);
-
-        for tz_name in links {
-            let tz_ident = name_to_ident(tz_name, Case::UpperSnake);
-            writeln!(
-                output,
-                "/// The `{tz_name}` time zone.\nconst {tz_ident}: TzifData = {canonical_ident};",
-            )?;
-        }
-    }
-
     Ok(())
 }
 
 /// Write the function to parse a time zone from a string.
-fn write_zone_data_from_name(
+fn write_zone_data_from_name<'a>(
     output: &mut impl Write,
-    time_zones: &TimeZones,
-    tz_links: &TimeZoneLinks,
+    time_zones: impl Iterator<Item = &'a TimeZone>,
 ) -> Result<()> {
     writeln!(
         output,
@@ -228,7 +246,7 @@ fn write_zone_data_from_name(
 
     let mut is_first = true;
 
-    for (tz_name, _) in time_zones {
+    for tz in time_zones {
         if is_first {
             is_first = false;
         } else {
@@ -238,19 +256,9 @@ fn write_zone_data_from_name(
         write!(
             output,
             "if s.eq_ignore_ascii_case(\"{}\") {{ Some({}) }}",
-            tz_name,
-            name_to_ident(tz_name, Case::UpperSnake)
+            &tz.name,
+            name_to_ident(tz.data_name(), Case::UpperSnake)
         )?;
-    }
-    for links in tz_links.values() {
-        for tz_name in links {
-            write!(
-                output,
-                "else if s.eq_ignore_ascii_case(\"{}\") {{ Some({}) }}",
-                tz_name,
-                name_to_ident(tz_name, Case::UpperSnake)
-            )?;
-        }
     }
     writeln!(output, "else {{ None }}}}")?;
 
@@ -258,48 +266,12 @@ fn write_zone_data_from_name(
 }
 
 /// Write the module hierarchy and structs.
-fn write_modules_and_structs(
+fn write_modules_and_structs<'a>(
     output: &mut impl Write,
-    time_zones: &TimeZones,
-    tz_links: &TimeZoneLinks,
+    time_zones: impl Iterator<Item = &'a TimeZone>,
 ) -> Result<()> {
-    write_module_item(output, modules::generate_items(time_zones, tz_links))?;
-    Ok(())
-}
-
-/// Write the module hierarchy and structs, excluding the root module.
-fn write_module_item(output: &mut impl Write, item: Item) -> Result<()> {
-    match item {
-        Item::Module { name, children } => {
-            write!(output, "pub mod {name} {{")?;
-            write!(output, "use super::*;")?;
-            for child in children {
-                write_module_item(output, child)?;
-            }
-            write!(output, "}}")?;
-        }
-        Item::Struct { name, full_name } => {
-            write!(
-                output,
-                "/// The `{full_name}` time zone.\npub struct {};",
-                name_to_ident(&name, Case::Pascal)
-            )?;
-            write!(
-                output,
-                "impl Sealed for {} {{\nconst NAME: &'static str = \"{}\";\nconst DATA: TzifData \
-                 = {};}}",
-                name_to_ident(&name, Case::Pascal),
-                full_name,
-                name_to_ident(&full_name, Case::UpperSnake)
-            )?;
-            write!(
-                output,
-                "impl TimeZone for {} {{}}",
-                name_to_ident(&name, Case::Pascal)
-            )?;
-        }
-    }
-
+    let root_item = modules::generate_items(time_zones);
+    writeln!(output, "{}", root_item.to_code()?)?;
     Ok(())
 }
 
@@ -331,7 +303,7 @@ fn main() -> Result<()> {
     })?;
 
     let tzif_dir = generate_tzif()?;
-    let (time_zones, tz_links) = gather_time_zones(tzif_dir)?;
+    let time_zones = gather_time_zones(tzif_dir)?;
 
     let mut rustfmt_process = spawn_rustfmt(&output_path)?;
     let mut rustfmt_stdin = rustfmt_process
@@ -339,18 +311,20 @@ fn main() -> Result<()> {
         .take()
         .context("could not obtain rustfmt stdin")?;
 
-    writeln!(rustfmt_stdin, "#![allow(warnings)]")?;
+    write!(
+        rustfmt_stdin,
+        "#![allow(warnings, clippy::if_same_then_else)]"
+    )?;
     // Imports to significantly reduce the size of the generated code.
-    writeln!(
+    write!(
         rustfmt_stdin,
         "use crate::{{*, TransitionDay::*, UtcLocalIndicator::*, StandardWallIndicator::*, \
          sealed::Sealed}};",
     )?;
 
-    write_zones(&mut rustfmt_stdin, &time_zones)?;
-    write_links(&mut rustfmt_stdin, &tz_links)?;
-    write_zone_data_from_name(&mut rustfmt_stdin, &time_zones, &tz_links)?;
-    write_modules_and_structs(&mut rustfmt_stdin, &time_zones, &tz_links)?;
+    write_zones(&mut rustfmt_stdin, time_zones.iter())?;
+    write_zone_data_from_name(&mut rustfmt_stdin, time_zones.iter())?;
+    write_modules_and_structs(&mut rustfmt_stdin, time_zones.iter())?;
 
     drop(rustfmt_stdin);
     rustfmt_process.wait()?;

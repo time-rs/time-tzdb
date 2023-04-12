@@ -9,7 +9,7 @@ use tzif::data::tzif::{
     UtLocalIndicator,
 };
 
-use crate::{name_to_ident, Item};
+use crate::{name_to_ident, Item, TimeZone, TimeZoneData};
 
 /// Convert the given value to a string of Rust code. Note that the output may rely on certain
 /// imports being present.
@@ -280,24 +280,34 @@ impl ToCode for Item {
         let mut s = String::new();
         match self {
             Self::Module { name, children } => {
-                s.push_str(&format!("pub mod {name} {{"));
+                let mod_name = match name.as_str() {
+                    "time_zones" => "time_zones".to_owned(),
+                    _ => name_to_ident(name, Case::Pascal),
+                };
+                s.push_str(&format!("pub mod {mod_name} {{"));
                 s.push_str("use super::*;");
                 for child in children {
                     s.push_str(&child.to_code()?);
                 }
                 s.push('}');
             }
-            Self::Struct { name, full_name } => {
+            Self::Struct {
+                name,
+                full_name,
+                canonical_name_of_link,
+            } => {
                 s.push_str(&format!(
                     "/// The `{full_name}` time zone.\npub struct {};",
                     name_to_ident(name, Case::Pascal)
                 ));
                 s.push_str(&format!(
-                    "impl Sealed for {} {{\nconst NAME: &'static str = \"{}\";\nconst DATA: \
-                     TzifData = {};}}",
+                    "impl Sealed for {} {{\nconst NAME: &'static str = \"{full_name}\";\nconst \
+                     DATA: TzifData = {};}}",
                     name_to_ident(name, Case::Pascal),
-                    full_name,
-                    name_to_ident(full_name, Case::UpperSnake)
+                    name_to_ident(
+                        canonical_name_of_link.as_ref().unwrap_or(full_name),
+                        Case::UpperSnake
+                    )
                 ));
                 s.push_str(&format!(
                     "impl TimeZone for {} {{}}",
@@ -307,5 +317,21 @@ impl ToCode for Item {
         }
 
         Ok(s)
+    }
+}
+
+impl ToCode for TimeZone {
+    fn to_code(&self) -> Result<String> {
+        let tz_name = &self.name;
+        let tz_ident = name_to_ident(tz_name, Case::UpperSnake);
+        let expr = match &self.data {
+            TimeZoneData::Canonical(data) => data.to_code()?,
+            TimeZoneData::Link(_) => {
+                // Nothing to write for links.
+                return Ok(String::new());
+            }
+        };
+
+        Ok(format!("const {tz_ident}: TzifData = {expr};"))
     }
 }

@@ -1,30 +1,41 @@
-use crate::{TimeZoneLinks, TimeZones};
+use crate::{TimeZone, TimeZoneData};
 
 #[derive(Debug)]
 pub(crate) enum Item {
-    Module { name: String, children: Vec<Item> },
-    Struct { name: String, full_name: String },
+    Module {
+        name: String,
+        children: Vec<Item>,
+    },
+    Struct {
+        name: String,
+        full_name: String,
+        canonical_name_of_link: Option<String>,
+    },
 }
 
-pub(crate) fn generate_items(time_zones: &TimeZones, tz_links: &TimeZoneLinks) -> Item {
+pub(crate) fn generate_items<'a>(time_zones: impl Iterator<Item = &'a TimeZone>) -> Item {
     let mut root = Item::Module {
         name: "time_zones".to_owned(),
         children: Vec::new(),
     };
 
-    let zone_names = time_zones.iter().map(|tz| tz.0.as_str());
-    let link_names = tz_links
-        .values()
-        .flat_map(|vec| vec.iter().map(|s| s.as_str()));
-
-    for zone_name in zone_names.chain(link_names) {
-        insert_zone(&mut root, zone_name, zone_name);
+    for tz in time_zones {
+        let canonical_name_of_link = match &tz.data {
+            TimeZoneData::Link(canonical_name) => Some(canonical_name.clone()),
+            TimeZoneData::Canonical(_) => None,
+        };
+        insert_zone(&mut root, &tz.name, &tz.name, canonical_name_of_link);
     }
 
     root
 }
 
-fn insert_zone(root: &mut Item, name: &str, original_name: &str) {
+fn insert_zone(
+    root: &mut Item,
+    name: &str,
+    original_name: &str,
+    canonical_name_of_link: Option<String>,
+) {
     let children = match root {
         Item::Module {
             ref mut children, ..
@@ -37,6 +48,7 @@ fn insert_zone(root: &mut Item, name: &str, original_name: &str) {
             children.push(Item::Struct {
                 name: name.to_owned(),
                 full_name: original_name.to_owned(),
+                canonical_name_of_link,
             });
         }
         Some((mod_name, rest)) => {
@@ -55,7 +67,7 @@ fn insert_zone(root: &mut Item, name: &str, original_name: &str) {
                 }
             };
 
-            insert_zone(module, rest, original_name);
+            insert_zone(module, rest, original_name, canonical_name_of_link);
         }
     }
 }
